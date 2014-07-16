@@ -45,31 +45,84 @@ module ActiveRecord
         Column = Struct.new(:name, :alias)
       end
 
-      attr_reader :alias_tracker, :base_klass, :join_root
+      class Tree
+        def initialize(associations = nil)
+          @tree = {}
+          add_associations(associations) if associations
+        end
 
-      def self.make_tree(associations)
-        hash = {}
-        walk_tree associations, hash
-        hash
-      end
+        def add_associations(associations)
+          walk(associations, @tree)
+        end
 
-      def self.walk_tree(associations, hash)
-        case associations
-        when Symbol, String
-          hash[associations.to_sym] ||= {}
-        when Array
-          associations.each do |assoc|
-            walk_tree assoc, hash
+        def add_if_associations(associations)
+          walk(associations, @tree, false)
+        end
+
+        def map(&block)
+          @tree.map(&block)
+        end
+
+        def drain_associations_as_join_dependency_param(associations_param)
+          join_dependency_param = nil
+          drain(associations_param) do |associations_name, subtree, multiple_values_incoming|
+            if multiple_values_incoming
+              (join_dependency_param ||= {})[associations_name] = subtree
+            elsif subtree.empty?
+              join_dependency_param = associations_name # no need for Hash, can avoid allocation
+            else
+              join_dependency_param = {associations_name => subtree}
+            end
           end
-        when Hash
-          associations.each do |k,v|
-            cache = hash[k] ||= {}
-            walk_tree v, cache
+          join_dependency_param
+        end
+
+        def drain_associations_as_join_infos(join_dependency, associations_param)
+          drain(associations_param) do |association_name, subtree, multiple_values_incoming|
+            yield join_dependency.association_make_inner_join(association_name)
           end
-        else
-          raise ConfigurationError, associations.inspect
+        end
+
+        private
+        def drain(associations_param)
+          case associations_param
+          when Symbol
+            if subtree = @tree.delete(associations_param)
+              yield associations_param, subtree, false
+            end
+          when Hash, Array
+            associations_param.public_send(associations_param.kind_of?(Hash) ? :each_key : :each) do |association_name|
+              if subtree = @tree.delete(association_name)
+                yield association_name, subtree, true
+              end
+            end
+          end
+        end
+
+        def walk(associations, hash, strict = true) # recursion is always strict
+          case associations
+          when Symbol, String
+            hash[associations.to_sym] ||= {}
+          when Array
+            associations.each do |assoc|
+              walk assoc, hash
+            end
+          when Hash
+            associations.each do |k,v|
+              cache = hash[k] ||= {}
+              walk v, cache
+            end
+          else
+            raise ConfigurationError, associations.inspect if strict
+          end
+        end
+
+        def self.to_tree(associations = nil)
+          associations.kind_of?(self) ? associations : new(associations)
         end
       end
+
+      attr_reader :alias_tracker, :base_klass, :join_root
 
       # base is the base class on which operation is taking place.
       # associations is the list of associations which are joined using hash, symbol or array.
@@ -92,10 +145,11 @@ module ActiveRecord
       #    associations # => [:appointments]
       #    joins # =>  []
       #
-      def initialize(base, associations, joins)
+      def initialize(base, associations, joins = [])
         @alias_tracker = AliasTracker.create(base.connection, joins)
         @alias_tracker.aliased_name_for(base.table_name, base.table_name) # Updates the count for base.table_name to 1
-        tree = self.class.make_tree associations
+        # associations Hash can be used directly, no need to explicitly convert it into Tree
+        tree = associations.kind_of?(Hash) ? associations : Tree.to_tree(associations)
         @join_root = JoinBase.new base, build(tree, base)
         @join_root.children.each { |child| construct_tables! @join_root, child }
       end
@@ -104,20 +158,14 @@ module ActiveRecord
         join_root.drop(1).map!(&:reflection)
       end
 
-      def join_constraints(outer_joins)
-        joins = join_root.children.flat_map { |child|
-          make_inner_joins join_root, child
-        }
-
-        joins.concat outer_joins.flat_map { |oj|
-          if join_root.match? oj.join_root
-            walk join_root, oj.join_root
-          else
-            oj.join_root.children.flat_map { |child|
-              make_outer_joins oj.join_root, child
-            }
-          end
-        }
+      def join_constraints_for_join_dependency(join)
+        if join_root.match? join.join_root
+          walk join_root, join.join_root
+        else
+          join.join_root.children.flat_map { |child|
+            make_outer_joins join.join_root, child
+          }
+        end
       end
 
       def aliases
@@ -148,6 +196,13 @@ module ActiveRecord
         }
 
         parents.values
+      end
+
+      def association_make_inner_join(association_name)
+        join_root.children.each do |child|
+          return make_inner_joins(join_root, child) if child.reflection.name == association_name
+        end
+        nil
       end
 
       private
